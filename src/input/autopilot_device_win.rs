@@ -90,7 +90,9 @@ impl InputDevice for WindowsInput {
                     *pointer_type_info.u.penInfo_mut() = POINTER_PEN_INFO {
                         pointerInfo: POINTER_INFO {
                             pointerType: PT_PEN,
-                            pointerId: event.pointer_id as u32,
+                            // There is only one pen. Browsers hand out arbitrary (even negative)
+                            // pointer ids, which the synthetic pen device does not like.
+                            pointerId: 1,
                             frameId: 0,
                             pointerFlags: pointer_flags,
                             sourceDevice: 0 as *mut winapi::ctypes::c_void, //maybe use syntheticPointerDeviceHandle here but works with 0

@@ -20,6 +20,10 @@ let last_fps_calc: number = performance.now();
 
 let check_video: HTMLInputElement;
 
+// Stored settings. Renamed from "settings" so the tablet build starts from its own defaults
+// instead of settings saved by older Weylus versions on the same address.
+const SETTINGS_KEY = "settings_tablet_v1";
+
 function run(level: string) {
     window.onload = () => {
         log_pre = document.getElementById("log") as HTMLPreElement;
@@ -210,6 +214,11 @@ class Settings {
         this.checks.get("enable_mouse").onchange = upd_pointer;
         this.checks.get("enable_stylus").onchange = upd_pointer;
         this.checks.get("enable_touch").onchange = upd_pointer;
+        this.checks.get("tablet_mode").onchange = () => {
+            if (!this.checks.get("tablet_mode").checked && view_gestures)
+                view_gestures.reset_view();
+            upd_pointer();
+        };
 
         this.checks.get("energysaving").onchange = (e) => {
             this.save_settings();
@@ -263,14 +272,16 @@ class Settings {
         settings["min_pressure"] = this.range_min_pressure.value;
         settings["custom_input_areas"] = this.custom_input_areas;
         settings["client_name"] = this.client_name_input.value;
-        localStorage.setItem("settings", JSON.stringify(settings));
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
     }
 
     load_settings() {
-        let settings_string = localStorage.getItem("settings");
+        let settings_string = localStorage.getItem(SETTINGS_KEY);
         if (settings_string === null) {
-            this.frame_rate_input.value = frame_rate_scale_inv(30).toString();
-            this.frame_rate_output.value = (30).toString();
+            // 60 fps by default: frames are only sent as fast as the link takes them (FrameAck),
+            // so a higher rate lowers latency without piling up video on slow links.
+            this.frame_rate_input.value = frame_rate_scale_inv(60).toString();
+            this.frame_rate_output.value = (60).toString();
             let [w, h] = calc_max_video_resolution(this.scale_video_input.valueAsNumber)
             this.scale_video_output.value = w + "x" + h;
             return;
@@ -463,11 +474,12 @@ class PEvent {
         // this.movement_x = event.movementX ? event.movementX : 0;
         // this.movement_y = event.movementY ? event.movementY : 0;
         this.pressure = Math.max(event.pressure, settings.range_min_pressure.valueAsNumber);
-        this.tilt_x = event.tiltX;
-        this.tilt_y = event.tiltY;
+        // The server expects whole numbers here; some browsers report fractions.
+        this.tilt_x = Math.round(event.tiltX || 0);
+        this.tilt_y = Math.round(event.tiltY || 0);
         this.width = event.width / diag_len;
         this.height = event.height / diag_len;
-        this.twist = event.twist;
+        this.twist = Math.round(event.twist || 0);
     }
 }
 
@@ -802,6 +814,16 @@ class PointerHandler {
                 }
             }
         }
+        // Tablet mode: fingers never reach the computer. They zoom/pan the view here and do
+        // shortcut taps; only the pen (and mouse) draws.
+        if (view_gestures && settings.checks.get("tablet_mode").checked) {
+            if (event.pointerType == "touch") {
+                view_gestures.on_touch(event, event_type);
+                return;
+            }
+            if (event.pointerType == "pen")
+                view_gestures.on_pen(event_type);
+        }
         if (this.pointerTypes.includes(event.pointerType)) {
             let rect = (event.target as HTMLElement).getBoundingClientRect();
             const events = event_type === "pointermove" && typeof event.getCoalescedEvents === 'function' ? event.getCoalescedEvents() : [event];
@@ -824,6 +846,195 @@ class PointerHandler {
         }
     }
 }
+
+// ---------------------------------------------------------------- tablet mode
+
+// Finger touches within this long of any pen activity (touching or hovering) are palms.
+const PEN_GRACE_MS = 500;
+// A tap: every finger lifts within this long and none moves further than this.
+const TAP_MAX_MS = 300;
+const TAP_SLOP_PX = 12;
+const MAX_ZOOM = 8;
+
+class TouchPoint {
+    x: number;
+    y: number;
+    start_x: number;
+    start_y: number;
+}
+
+class Pinch {
+    distance: number;
+    mid_x: number;
+    mid_y: number;
+    scale: number;
+    tx: number;
+    ty: number;
+}
+
+/**
+ * Tablet mode for the view on this device (nothing here reaches the computer, except the
+ * shortcut taps):
+ *  - two fingers pinch to zoom and drag to pan the picture; pinch back out to reset;
+ *  - one finger does nothing, so a resting hand never draws or moves anything;
+ *  - palm rejection: a touch sequence that starts while the pen is touching or hovering (or
+ *    within PEN_GRACE_MS of it) is ignored entirely, and putting the pen down cancels any
+ *    gesture in progress;
+ *  - two-finger tap = undo (Ctrl+Z), three-finger tap = redo (Ctrl+Shift+Z).
+ * The zoom is a CSS transform on #main. Pen coordinates are computed from the video's
+ * on-screen rectangle, which includes this transform, so the pen still lands where it points.
+ */
+class ViewGestures {
+    webSocket: WebSocket;
+    main: HTMLElement;
+    scale = 1;
+    tx = 0;
+    ty = 0;
+    touches = new Map<number, TouchPoint>();
+    max_touches = 0;
+    sequence_start = 0;
+    moved = false;
+    rejected = false;
+    pen_until = 0;
+    pinch: Pinch = null;
+
+    constructor(webSocket: WebSocket) {
+        this.webSocket = webSocket;
+        this.main = document.getElementById("main");
+        this.main.style.transformOrigin = "0 0";
+    }
+
+    on_pen(event_type: string) {
+        let now = performance.now();
+        this.pen_until = now + PEN_GRACE_MS;
+        if (event_type == "pointerdown" && this.touches.size > 0) {
+            // the hand touched first, then the pen came down: it was a palm
+            this.rejected = true;
+            this.pinch = null;
+        }
+    }
+
+    on_touch(event: PointerEvent, event_type: string) {
+        let now = performance.now();
+        let id = event.pointerId;
+        switch (event_type) {
+            case "pointerdown": {
+                if (this.touches.size == 0) {
+                    this.max_touches = 0;
+                    this.moved = false;
+                    this.rejected = false;
+                    this.sequence_start = now;
+                }
+                if (now < this.pen_until)
+                    this.rejected = true;
+                this.touches.set(id, {
+                    x: event.clientX, y: event.clientY,
+                    start_x: event.clientX, start_y: event.clientY
+                });
+                this.max_touches = Math.max(this.max_touches, this.touches.size);
+                this.begin_pinch();
+                break;
+            }
+            case "pointermove": {
+                let t = this.touches.get(id);
+                if (!t)
+                    return;
+                t.x = event.clientX;
+                t.y = event.clientY;
+                if (Math.hypot(t.x - t.start_x, t.y - t.start_y) > TAP_SLOP_PX)
+                    this.moved = true;
+                if (!this.rejected && this.pinch)
+                    this.update_pinch();
+                break;
+            }
+            case "pointerup":
+            case "pointercancel": {
+                if (!this.touches.has(id))
+                    return;
+                this.touches.delete(id);
+                if (this.touches.size > 0) {
+                    this.begin_pinch(); // carry on with the fingers still down
+                    return;
+                }
+                this.pinch = null;
+                let tapped = event_type == "pointerup" && !this.rejected && !this.moved
+                    && now - this.sequence_start <= TAP_MAX_MS;
+                if (tapped && this.max_touches == 2)
+                    this.send_shortcut(false);
+                else if (tapped && this.max_touches == 3)
+                    this.send_shortcut(true);
+                if (this.scale < 1.05)
+                    this.reset_view();
+                break;
+            }
+        }
+    }
+
+    begin_pinch() {
+        if (this.touches.size != 2 || this.rejected) {
+            this.pinch = null;
+            return;
+        }
+        let [a, b] = Array.from(this.touches.values());
+        this.pinch = {
+            distance: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)),
+            mid_x: (a.x + b.x) / 2,
+            mid_y: (a.y + b.y) / 2,
+            scale: this.scale,
+            tx: this.tx,
+            ty: this.ty,
+        };
+    }
+
+    update_pinch() {
+        if (this.touches.size != 2)
+            return;
+        let [a, b] = Array.from(this.touches.values());
+        let p = this.pinch;
+        let distance = Math.max(1, Math.hypot(a.x - b.x, a.y - b.y));
+        let mid_x = (a.x + b.x) / 2;
+        let mid_y = (a.y + b.y) / 2;
+        let scale = Math.min(MAX_ZOOM, Math.max(1, p.scale * distance / p.distance));
+        // keep the picture point that was under the fingers' midpoint under it
+        let content_x = (p.mid_x - p.tx) / p.scale;
+        let content_y = (p.mid_y - p.ty) / p.scale;
+        this.set_view(scale, mid_x - content_x * scale, mid_y - content_y * scale);
+    }
+
+    set_view(scale: number, tx: number, ty: number) {
+        let w = this.main.clientWidth;
+        let h = this.main.clientHeight;
+        // never show anything outside the picture
+        this.scale = scale;
+        this.tx = Math.min(0, Math.max(w - w * scale, tx));
+        this.ty = Math.min(0, Math.max(h - h * scale, ty));
+        this.main.style.transform = scale == 1 ? "" :
+            "translate(" + this.tx + "px, " + this.ty + "px) scale(" + scale + ")";
+    }
+
+    reset_view() {
+        this.set_view(1, 0, 0);
+    }
+
+    send_shortcut(redo: boolean) {
+        for (let event_type of ["down", "up"]) {
+            this.webSocket.send(JSON.stringify({
+                "KeyboardEvent": {
+                    event_type: event_type,
+                    code: "KeyZ",
+                    key: "z",
+                    location: 0,
+                    alt: false,
+                    ctrl: true,
+                    shift: redo,
+                    meta: false,
+                }
+            }));
+        }
+    }
+}
+
+let view_gestures: ViewGestures = null;
 
 class KEvent {
     event_type: string;
@@ -978,7 +1189,9 @@ function handle_messages(
             return;
         }
 
-        // not a string -> got a video frame
+        // not a string -> got a video frame. Tell the server at once so it keeps sending
+        // (it holds back new frames while too many are unacknowledged).
+        webSocket.send('"FrameAck"');
         queue.push(event.data);
         upd_buf();
         frame_count += 1;
@@ -1034,6 +1247,7 @@ function init() {
 
     debug_overlay = document.getElementById("debug_overlay");
     settings = new Settings(webSocket);
+    view_gestures = new ViewGestures(webSocket);
 
     let video = document.getElementById("video") as HTMLVideoElement;
     let canvas = document.getElementById("canvas") as HTMLCanvasElement;
@@ -1075,6 +1289,7 @@ function init() {
     webSocket.onerror = () => handle_disconnect("Lost connection.");
     webSocket.onclose = () => handle_disconnect("Connection closed.");
     window.onresize = () => {
+        view_gestures.reset_view();
         stretch_video();
         canvas.width = window.innerWidth * window.devicePixelRatio;
         canvas.height = window.innerHeight * window.devicePixelRatio;

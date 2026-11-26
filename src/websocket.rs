@@ -2,6 +2,7 @@ use fastwebsockets::{FragmentCollectorRead, Frame, OpCode, WebSocket, WebSocketE
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{mpsc, Arc};
 use std::thread::{spawn, JoinHandle};
@@ -55,7 +56,12 @@ pub struct WeylusClientHandler<S, R, FnUInput> {
     capture_cursor: bool,
     client_name: Option<String>,
     video_thread: JoinHandle<()>,
+    /// Video messages sent but not yet acknowledged by the client (see MessageInbound::FrameAck).
+    unacked_frames: Arc<AtomicUsize>,
 }
+
+/// Stop producing frames while this many video messages are still on their way to the client.
+const MAX_UNACKED_FRAMES: usize = 3;
 
 #[derive(Clone, Copy)]
 pub struct WeylusClientConfig {
@@ -77,11 +83,20 @@ impl<S, R, FnUInput> WeylusClientHandler<S, R, FnUInput> {
         S: WeylusSender + Clone + Send + Sync + 'static,
     {
         let (video_sender, video_receiver) = mpsc::channel::<VideoCommands>();
+        let unacked_frames = Arc::new(AtomicUsize::new(0));
         let video_thread = {
             let sender = sender.clone();
+            let unacked_frames = unacked_frames.clone();
             // offload creating the videostream to another thread to avoid blocking the thread that
             // is receiving messages from the websocket
-            spawn(move || handle_video(video_receiver, sender, config.encoder_options))
+            spawn(move || {
+                handle_video(
+                    video_receiver,
+                    sender,
+                    config.encoder_options,
+                    unacked_frames,
+                )
+            })
         };
 
         Self {
@@ -96,6 +111,7 @@ impl<S, R, FnUInput> WeylusClientHandler<S, R, FnUInput> {
             capture_cursor: false,
             client_name: None,
             video_thread,
+            unacked_frames,
         }
     }
 
@@ -123,6 +139,14 @@ impl<S, R, FnUInput> WeylusClientHandler<S, R, FnUInput> {
                         }
                         MessageInbound::RestartVideo => {
                             self.video_sender.send(VideoCommands::Restart).unwrap()
+                        }
+                        MessageInbound::FrameAck => {
+                            // never go below zero (acks for frames sent before a reset)
+                            let _ = self.unacked_frames.fetch_update(
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                                |n| Some(n.saturating_sub(1)),
+                            );
                         }
                         MessageInbound::ChooseCustomInputAreas => {
                             let (sender, receiver) = std::sync::mpsc::channel();
@@ -304,8 +328,12 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
     receiver: mpsc::Receiver<VideoCommands>,
     mut sender: S,
     encoder_options: EncoderOptions,
+    unacked_frames: Arc<AtomicUsize>,
 ) {
     const EFFECTIVE_INIFINITY: Duration = Duration::from_secs(3600 * 24 * 365 * 200);
+    // If the client stops acknowledging (old client, lost messages), resume after this long.
+    const ACK_TIMEOUT: Duration = Duration::from_millis(1000);
+    let mut waiting_for_acks_since: Option<Instant> = None;
 
     let mut recorder: Option<Box<dyn Recorder>> = None;
     let mut video_encoder: Option<Box<VideoEncoder>> = None;
@@ -358,6 +386,8 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
                     }
                 }
                 last_frame = Instant::now();
+                unacked_frames.store(0, Ordering::SeqCst);
+                waiting_for_acks_since = None;
 
                 // The Duration type can not handle infinity, if the frame rate is set to 0 we just
                 // set the duration between two frames to a very long one, which is effectively
@@ -384,6 +414,18 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
                     warn!("Screen capture not initalized, can not send video frame!");
                     continue;
                 }
+                // Flow control: skip this frame while the client has not caught up. Skipping
+                // before capture/encode keeps the H.264 stream valid; it only lowers the frame rate
+                // on slow links instead of building up seconds of queued video.
+                if unacked_frames.load(Ordering::SeqCst) >= MAX_UNACKED_FRAMES {
+                    let since = *waiting_for_acks_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() < ACK_TIMEOUT {
+                        continue;
+                    }
+                    trace!("No frame acks for {ACK_TIMEOUT:?}, resetting flow control.");
+                    unacked_frames.store(0, Ordering::SeqCst);
+                }
+                waiting_for_acks_since = None;
                 let pixel_data = recorder.as_mut().unwrap().capture();
                 if let Err(err) = pixel_data {
                     warn!("Error capturing screen: {}", err);
@@ -411,12 +453,14 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
                 {
                     send_message(&mut sender, MessageOutbound::NewVideo);
                     let mut sender = sender.clone();
+                    let unacked_frames = unacked_frames.clone();
                     let res = VideoEncoder::new(
                         width_in,
                         height_in,
                         width_out,
                         height_out,
                         move |data| {
+                            unacked_frames.fetch_add(1, Ordering::SeqCst);
                             if let Err(err) = sender.send_video(data) {
                                 warn!("Failed to send video frame: {err}!");
                             }

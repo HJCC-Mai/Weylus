@@ -23,6 +23,10 @@ pub enum MessageInbound {
     ResumeVideo,
     RestartVideo,
     ChooseCustomInputAreas,
+    /// The client has received one binary video message. Used for flow control: the server stops
+    /// producing new frames while too many sent messages are still unacknowledged, so frames never
+    /// pile up in network buffers (which shows up as ever-growing lag on slow links).
+    FrameAck,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
